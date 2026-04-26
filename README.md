@@ -1,6 +1,3 @@
-> 🇷🇺 [Читать на русском](README.ru.md)
-
-
 # 📚 AI Library Renamer
 
 **AI-powered tool for renaming and categorizing book archives using a local LLM (Ollama)**
@@ -184,4 +181,8 @@ flowchart TD
     K -- No --> N[Done]
 ```
 
+---
 
+## 📄 License
+
+MIT

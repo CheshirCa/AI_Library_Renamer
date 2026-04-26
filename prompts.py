@@ -1,20 +1,58 @@
 import os
 import json
+import collections
 from typing import Dict, Any
 from file_tools import identify_main_document
+
+# Максимум файлов в промпте — больше не нужно, только нагружает контекст
+_MAX_FILES_IN_PROMPT = 30
+
+# Расширения которые считаются «балластом» — группируем, не перечисляем все
+_BULK_EXTENSIONS = {'.tif', '.tiff', '.png', '.jpg', '.jpeg', '.bmp',
+                    '.gif', '.webp', '.pnm', '.svg'}
 
 
 def _archive_content_for_llm(archive_content: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Возвращает копию archive_content без поля 'path' в файлах.
-    Абсолютные пути вроде /tmp/tmpXXXX/book.pdf бесполезны для LLM,
-    засоряют контекст и раскрывают структуру системы.
+    Подготавливает archive_content для передачи в LLM:
+    - Убирает поле 'path' (абсолютные пути бесполезны для модели)
+    - Группирует однотипные файлы (сотни TIF → одна строка-сводка)
+    - Обрезает список до MAX_FILES_IN_PROMPT значимых файлов
     """
+    files = archive_content.get('files', [])
+
+    # Разделяем файлы на «значимые» и «балласт»
+    important = []
+    bulk: Dict[str, list] = collections.defaultdict(list)
+
+    for f in files:
+        if f.get('type') == 'directory':
+            continue
+        ext = os.path.splitext(f['name'])[1].lower()
+        if ext in _BULK_EXTENSIONS:
+            bulk[ext].append(f)
+        else:
+            important.append({k: v for k, v in f.items() if k != 'path'})
+
+    # Обрезаем значимые файлы если их очень много
+    truncated = len(important) > _MAX_FILES_IN_PROMPT
+    shown = important[:_MAX_FILES_IN_PROMPT]
+
+    # Добавляем сводку по балластным группам
+    summaries = []
+    for ext, group in sorted(bulk.items()):
+        total_size = sum(f.get('size') or 0 for f in group)
+        summaries.append({
+            'summary': f"{len(group)} файлов {ext} (итого {total_size // 1024} KB) — изображения, пропущены"
+        })
+
+    if truncated:
+        summaries.append({
+            'summary': f"... и ещё {len(important) - _MAX_FILES_IN_PROMPT} файлов (не показаны)"
+        })
+
     return {
-        'files': [
-            {k: v for k, v in f.items() if k != 'path'}
-            for f in archive_content.get('files', [])
-        ],
+        'files': shown + summaries,
         'metadata_content': archive_content.get('metadata_content', {}),
     }
 

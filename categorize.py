@@ -29,6 +29,57 @@ import tempfile
 import argparse
 from typing import Optional
 
+# Добавляем папку скрипта в sys.path — чтобы работало при запуске из любой директории
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+def _fix_windows_cmdline():
+    """
+    Исправляет проблему Windows cmd.exe: путь вида "C:\\dir\\" при парсинге
+    CommandLineToArgvW сливается со следующим аргументом, потому что \\"
+    трактуется как экранированная кавычка.
+    Решение: берём сырую командную строку через WinAPI, убираем экранирование
+    и перепарсиваем заново.
+    """
+    if sys.platform != 'win32':
+        sys.argv = [a.rstrip('/\\') for a in sys.argv]
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes
+        kernel32 = ctypes.windll.kernel32
+        shell32  = ctypes.windll.shell32
+        GetCommandLineW = kernel32.GetCommandLineW
+        GetCommandLineW.restype = ctypes.c_wchar_p
+        raw   = GetCommandLineW()
+        fixed = raw.replace('\\"', '"')
+        argc  = ctypes.c_int(0)
+        CommandLineToArgvW = shell32.CommandLineToArgvW
+        CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+        argv_ptr = CommandLineToArgvW(fixed, ctypes.byref(argc))
+        if argv_ptr and argc.value > 0:
+            all_args = [argv_ptr[i].rstrip('/\\') for i in range(argc.value)]
+            ctypes.windll.kernel32.LocalFree(argv_ptr)
+            # CommandLineToArgvW включает python.exe как argv[0], а скрипт как argv[1].
+            # Python уже убрал интерпретатор из sys.argv, поэтому ищем скрипт
+            # по совпадению basename и берём всё после него.
+            script = os.path.basename(sys.argv[0]).lower()
+            start  = next(
+                (i for i, a in enumerate(all_args)
+                 if os.path.basename(a).lower() == script),
+                None
+            )
+            if start is not None:
+                sys.argv = [sys.argv[0]] + all_args[start + 1:]
+            else:
+                # Fallback: пропускаем python.exe и скрипт (первые два элемента)
+                sys.argv = [sys.argv[0]] + all_args[min(2, len(all_args)):]
+        else:
+            sys.argv = [a.rstrip('/\\') for a in sys.argv]
+    except Exception as e:
+        sys.argv = [a.rstrip('/\\') for a in sys.argv]
+
+
+
 # Подгружаем конфиг
 from config import BOOK_CATEGORIES, OUTPUT_BASE_DIR, OLLAMA_MODEL
 from llm_client import send_to_llm
@@ -258,6 +309,7 @@ def main():
         help="Не спрашивать подтверждения, перемещать сразу"
     )
     parser.add_argument("--debug", action="store_true", help="Подробный вывод")
+    _fix_windows_cmdline()
     args = parser.parse_args()
 
     logging.basicConfig(

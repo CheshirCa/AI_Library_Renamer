@@ -44,15 +44,13 @@ def scan_archive_content(directory: str) -> Dict[str, Any]:
                 or any(fnmatch.fnmatch(name_lower, pat) for pat in META_PATTERNS)
             )
             if is_meta:
-                for encoding in ('utf-8', 'cp1251', 'cp866'):
-                    try:
-                        with open(full_path, 'r', encoding=encoding, errors='strict') as f:
-                            content['metadata_content'][name] = f.read(2000)
-                        break
-                    except (UnicodeDecodeError, UnicodeError):
-                        continue
-                    except Exception:
-                        break
+                try:
+                    from formats.txt_handler import decode_text
+                    with open(full_path, 'rb') as f:
+                        raw = f.read(2000)
+                    content['metadata_content'][name] = decode_text(raw)
+                except Exception:
+                    pass
 
     return content
 

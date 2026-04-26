@@ -7,7 +7,9 @@ def _register_handlers():
     """Ленивая регистрация обработчиков"""
     from .txt_handler   import TXTHandler
     from .pdf_handler   import PDFHandler
+    from .doc_handler   import DOCHandler
     from .docx_handler  import DOCXHandler
+    from .rtf_handler   import RTFHandler
     from .fb2_handler   import FB2Handler
     from .djvu_handler  import DJVUHandler
     from .mobi_handler  import MOBIHandler
@@ -19,7 +21,9 @@ def _register_handlers():
     HANDLERS = [
         TXTHandler,
         PDFHandler,
+        DOCHandler,       # ВАЖНО: до DOCXHandler — проверяет magic bytes
         DOCXHandler,
+        RTFHandler,
         FB2Handler,
         DJVUHandler,
         MOBIHandler,
