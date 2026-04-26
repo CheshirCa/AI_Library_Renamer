@@ -62,6 +62,7 @@ from file_tools import identify_main_document, extract_text_data
 from llm_client import send_to_llm
 from prompts import build_initial_prompt, build_text_analysis_prompt, build_retry_prompt, build_categorize_prompt
 from archive_tools import extract_archive, scan_archive_content
+from text_utils import fix_filename, normalize_unicode
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ MAX_USER_ROUNDS = 3   # максимум раундов пользователь
 
 def sanitize_filename(name: str) -> str:
     name = os.path.basename(name)
+    name = normalize_unicode(name)                            # исправляем й/ё-артефакты
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
     name = name.strip('. ')
     return name or "renamed_archive"
@@ -82,26 +84,29 @@ _CONTENT_EXTENSIONS = {'.djvu', '.pdf', '.fb2', '.epub', '.docx', '.doc',
 
 def _fix_extension(proposed_name: str, archive_path: str) -> str:
     """
-    Гарантирует что имя архива имеет правильное расширение.
-    Убирает расширения файлов-содержимого которые LLM могла вставить в имя.
-    Пример: 'Книга.djvu.rar' → 'Книга.rar'
-             'Книга.djvu'     → 'Книга.rar'
-             'Книга.rar'      → 'Книга.rar'
+    Гарантирует правильное расширение архива и нормализует имя:
+    - Убирает расширения файлов-содержимого (.djvu, .pdf и т.п.)
+    - NFC Unicode (исправляет й/ё-артефакты)
+    - Транслит → кириллица
+    - Подчёркивания → пробелы
     """
     correct_ext = os.path.splitext(archive_path)[1].lower()
-
-    # Сначала снимаем правильное расширение если оно уже есть последним
     stem = proposed_name
+
+    # Снимаем правильное расширение если стоит последним
     if stem.lower().endswith(correct_ext):
         stem = stem[:-len(correct_ext)]
 
-    # Затем снимаем все лишние расширения содержимого
+    # Снимаем лишние расширения содержимого
     for _ in range(5):
         base, ext = os.path.splitext(stem)
         if ext.lower() in _CONTENT_EXTENSIONS:
             stem = base
         else:
             break
+
+    # Нормализуем имя (NFC + транслит + подчёркивания)
+    stem = fix_filename(stem, apply_translit=True)
 
     return stem + correct_ext
 
@@ -162,6 +167,41 @@ def _extract_text_for_file(archive_content: dict, target: str, parameters: dict)
         return file_obj, None   # None = ошибка извлечения
     logger.debug(f"Извлечено {len(text)} символов из '{file_obj['name']}'")
     return file_obj, text
+
+
+def _ask_user_about_variants(names: list, variants: list) -> tuple:
+    """
+    Показывает нумерованный список вариантов имени.
+    Возвращает (user_answer, chosen_name) где user_answer — 'accept'/'skip'/'retry'/<свой текст>.
+    """
+    print()
+    for i, name in enumerate(names, 1):
+        clean = sanitize_filename(name)
+        confidence = ""
+        reason = ""
+        if i - 1 < len(variants):
+            v = variants[i - 1]
+            confidence = f" [{v.get('confidence', '?')}%]"
+            reason = f" — {v.get('reason', '')}" if v.get('reason') else ""
+        print(f"  [{i}] {clean}{confidence}{reason}")
+    print()
+    print("  Введи номер варианта, [n] искать дальше, [s] пропустить, или своё имя:")
+    answer = input("  > ").strip()
+
+    # Цифровой выбор
+    if answer.isdigit():
+        idx = int(answer) - 1
+        if 0 <= idx < len(names):
+            return 'accept', names[idx]
+        print(f"  Нет варианта {answer}, использую первый.")
+        return 'accept', names[0]
+
+    if answer.lower() in ('n', 'н', 'no', 'нет'):
+        return 'retry', names[0]
+    if answer.lower() in ('s', 'п', 'skip', 'пропустить', ''):
+        return 'skip', names[0]
+    # Своё имя
+    return answer, answer
 
 
 def _ask_user_about_name(proposed_name: str) -> str:
@@ -244,13 +284,22 @@ def handle_llm_decision(archive_path: str, archive_content: dict,
     decision = llm_response.get('decision')
 
     if decision == 'rename':
-        new_name = llm_response.get('new_name')
-        if not new_name:
-            logger.error("LLM вернула 'rename' без 'new_name'")
+        # Поддерживаем оба формата: старый {new_name} и новый {variants:[]}
+        variants = llm_response.get('variants')
+        if variants and isinstance(variants, list):
+            # Новый формат с несколькими вариантами
+            names = [_fix_extension(v.get('name', ''), archive_path)
+                     for v in variants if v.get('name')]
+            names = [n for n in names if n]  # убираем пустые
+        else:
+            # Старый формат с одним именем
+            raw = llm_response.get('new_name', '')
+            names = [_fix_extension(raw, archive_path)] if raw else []
+
+        if not names:
+            logger.error("LLM вернула 'rename' без имён")
             _ask_manual_name(archive_path, _extracted_texts)
             return
-
-        new_name = _fix_extension(new_name, archive_path)
 
         # Вспомогательная функция: переименовать и сразу категоризировать
         def _do_rename_and_categorize(path, name):
@@ -260,13 +309,20 @@ def handle_llm_decision(archive_path: str, archive_content: dict,
                 categorize_and_move(new_path, name, extracted_text, auto_rename)
 
         if auto_rename:
-            _do_rename_and_categorize(archive_path, new_name)
+            _do_rename_and_categorize(archive_path, names[0])
             return
 
-        user_answer = _ask_user_about_name(new_name)
+        # --- Интерактивный режим ---
+        if len(names) == 1:
+            # Один вариант — старое поведение
+            user_answer = _ask_user_about_name(names[0])
+            chosen = names[0]
+        else:
+            # Несколько вариантов — нумерованный список
+            user_answer, chosen = _ask_user_about_variants(names, variants or [])
 
         if user_answer == 'accept':
-            _do_rename_and_categorize(archive_path, new_name)
+            _do_rename_and_categorize(archive_path, chosen)
 
         elif user_answer == 'skip':
             print("  Пропускаем.")
@@ -274,7 +330,7 @@ def handle_llm_decision(archive_path: str, archive_content: dict,
         elif user_answer == 'retry':
             print("  Ищем дополнительную информацию...")
             _retry_with_more_data(
-                archive_path, archive_content, new_name,
+                archive_path, archive_content, chosen,
                 auto_rename, _depth, _user_round + 1, _extracted_texts
             )
 

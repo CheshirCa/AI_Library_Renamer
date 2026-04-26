@@ -1,15 +1,117 @@
 import os
+import sys
+import shutil
+import subprocess
 import patoolib
 import fnmatch
 from typing import Dict, Any, List
 
+import logging
+logger = logging.getLogger(__name__)
+
+# Пути к архиваторам на Windows — ищем в типичных местах
+_WINRAR_PATHS = [
+    r"C:\Program Files\WinRAR\rar.exe",
+    r"C:\Program Files\WinRAR\WinRAR.exe",
+    r"C:\Program Files (x86)\WinRAR\rar.exe",
+    r"C:\Program Files (x86)\WinRAR\WinRAR.exe",
+]
+_7ZIP_PATHS = [
+    r"C:\Program Files\7-Zip\7z.exe",
+    r"C:\Program Files (x86)\7-Zip\7z.exe",
+]
+
+
+def _find_tool(paths: list) -> str:
+    """Ищет инструмент в PATH или по известным путям."""
+    name = os.path.basename(paths[0])
+    found = shutil.which(name)
+    if found:
+        return found
+    for p in paths:
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def _extract_with_subprocess(archive_path: str, output_dir: str) -> bool:
+    """
+    Прямой вызов WinRAR или 7-Zip через subprocess с явным указанием кодировки.
+    Возвращает True при успехе.
+    """
+    ext = os.path.splitext(archive_path)[1].lower()
+
+    # WinRAR — умеет и RAR и ZIP
+    rar = _find_tool(_WINRAR_PATHS)
+    if rar and ext in ('.rar', '.zip', '.7z'):
+        try:
+            result = subprocess.run(
+                [rar, 'x', '-y', '-o+', archive_path, output_dir + os.sep],
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode in (0, 1):  # 1 = предупреждение, не ошибка
+                return True
+            err = result.stderr.decode('cp866', errors='replace').strip()
+            logger.warning(f"WinRAR вернул код {result.returncode}: {err[:200]}")
+        except Exception as e:
+            logger.debug(f"WinRAR subprocess ошибка: {e}")
+
+    # 7-Zip — универсальный fallback
+    z = _find_tool(_7ZIP_PATHS)
+    if z:
+        try:
+            result = subprocess.run(
+                [z, 'x', '-y', f'-o{output_dir}', archive_path],
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode == 0:
+                return True
+            err = result.stderr.decode('cp866', errors='replace').strip()
+            logger.warning(f"7-Zip вернул код {result.returncode}: {err[:200]}")
+        except Exception as e:
+            logger.debug(f"7-Zip subprocess ошибка: {e}")
+
+    return False
+
 
 def extract_archive(archive_path: str, output_dir: str) -> None:
-    """Распаковывает архив в указанную директорию"""
+    """
+    Распаковывает архив в указанную директорию.
+
+    Стратегия:
+      1. patoolib — универсальный, работает с большинством форматов
+      2. При UnicodeDecodeError (WinRAR выдаёт cp866, patoolib ожидает UTF-8) —
+         прямой вызов WinRAR или 7-Zip через subprocess
+    """
     try:
         patoolib.extract_archive(archive_path, outdir=output_dir)
+        return
+    except UnicodeDecodeError as e:
+        logger.warning(
+            f"patoolib: ошибка кодировки при чтении вывода архиватора ({e}). "
+            f"Пробуем прямой вызов subprocess..."
+        )
     except Exception as e:
-        raise Exception(f"Ошибка распаковки архива: {e}")
+        err_str = str(e)
+        if 'codec' in err_str or 'decode' in err_str or 'encode' in err_str:
+            logger.warning(
+                f"patoolib: возможная проблема кодировки: {e}. "
+                f"Пробуем прямой вызов subprocess..."
+            )
+        else:
+            raise Exception(f"Ошибка распаковки архива: {e}")
+
+    # Fallback: прямой subprocess
+    if _extract_with_subprocess(archive_path, output_dir):
+        logger.info("Архив распакован через прямой вызов архиватора")
+        return
+
+    raise Exception(
+        f"Не удалось распаковать архив '{os.path.basename(archive_path)}'. "
+        f"Убедитесь что WinRAR или 7-Zip установлен и доступен."
+    )
 
 
 def scan_archive_content(directory: str) -> Dict[str, Any]:
