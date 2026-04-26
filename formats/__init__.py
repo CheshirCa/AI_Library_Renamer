@@ -1,6 +1,8 @@
 from typing import Dict
 import logging
 
+_VERSION = "2.0.0"  # с CHMHandler, DOCHandler, MOBIHandler, RTFHandler
+
 HANDLERS = []
 
 def _register_handlers():
@@ -10,6 +12,7 @@ def _register_handlers():
     from .doc_handler   import DOCHandler
     from .docx_handler  import DOCXHandler
     from .rtf_handler   import RTFHandler
+    from .chm_handler   import CHMHandler
     from .fb2_handler   import FB2Handler
     from .djvu_handler  import DJVUHandler
     from .mobi_handler  import MOBIHandler
@@ -21,9 +24,10 @@ def _register_handlers():
     HANDLERS = [
         TXTHandler,
         PDFHandler,
-        DOCHandler,       # ВАЖНО: до DOCXHandler — проверяет magic bytes
+        DOCHandler,       # до DOCXHandler — проверяет magic bytes
         DOCXHandler,
         RTFHandler,
+        CHMHandler,
         FB2Handler,
         DJVUHandler,
         MOBIHandler,

@@ -58,13 +58,20 @@ def _is_uninformative_name(name: str) -> bool:
     """
     True если имя файла/архива не несёт смысловой информации:
     числа, короткие коды, случайный набор символов.
+    Дефис считается разделителем слов (как пробел/подчёркивание):
+    'azure-active-directory-hybrid' — информативное имя.
     """
     stem = os.path.splitext(name)[0]
     if stem.isdigit():
         return True
     if len(stem) < 4:
         return True
-    if len(stem) > 15 and ' ' not in stem and '_' not in stem and stem.isascii():
+    # Длинная ASCII строка БЕЗ каких-либо разделителей — вероятно случайный код
+    if (len(stem) > 15
+            and ' ' not in stem
+            and '_' not in stem
+            and '-' not in stem
+            and stem.isascii()):
         return True
     return False
 
@@ -91,8 +98,33 @@ def build_initial_prompt(archive_name: str, archive_content: Dict[str, Any]) -> 
 
     archive_name_uninformative = _is_uninformative_name(archive_name)
     main_doc_uninformative     = _is_uninformative_name(main_doc) if main_doc else True
+    has_metadata               = bool(metadata_files)
 
-    if archive_name_uninformative and main_doc_uninformative:
+    # Определяем: имя архива — читаемое английское название (не транслит, есть разделители)
+    _stem = os.path.splitext(archive_name)[0]
+    _has_separators = (' ' in _stem or '-' in _stem or '_' in _stem)
+    _name_is_english_readable = (
+        not archive_name_uninformative
+        and _stem.isascii()
+        and _has_separators
+    )
+
+    if has_metadata:
+        # Метафайл (DIZ/NFO/README) есть — он приоритетнее имён файлов
+        hint = (
+            "В архиве есть метафайл с описанием (FILE_ID.DIZ, README или NFO). "
+            "Используй его содержимое как ОСНОВНОЙ источник для определения названия. "
+            "Если метафайл содержит чёткое название — сразу возвращай rename, не запрашивай текст."
+        )
+    elif _name_is_english_readable:
+        # Имя архива — читаемое английское название (пробелы/дефисы, ASCII)
+        hint = (
+            "Имя архива содержит читаемое английское название. "
+            "Если слова складываются в осмысленное название книги — верни rename СРАЗУ, "
+            "без запроса текста. Автора можно опустить если его нет в имени. "
+            "Формат без автора: «Название{archive_ext}»."
+        )
+    elif archive_name_uninformative and main_doc_uninformative:
         hint = (
             "ВАЖНО: Имя архива и имя файла внутри — цифровые коды или случайный набор символов. "
             "Они не несут информации о содержимом книги. "
@@ -106,7 +138,11 @@ def build_initial_prompt(archive_name: str, archive_content: Dict[str, Any]) -> 
     else:
         hint = (
             "Имя архива может быть транслитерацией русского названия или содержать аббревиатуры. "
-            "Учти это при анализе, но при сомнениях запрашивай текст из документа."
+            "Расшифровка типичных аббревиатур в именах файлов: "
+            "'_af_' / '_vv_' / '_np_' — инициалы автора (А.Ф., В.В., Н.П.); "
+            "'_sost_' — составитель (сост.); '_red_' — редактор; "
+            "'_per_' — перевод/переводчик; '_izd_' — издание. "
+            "Учти это при анализе имени, но при сомнениях запрашивай текст из документа."
         )
 
     return f"""Ты — библиограф. Определи, что за книга или документ находится в архиве, \
@@ -126,14 +162,15 @@ def build_initial_prompt(archive_name: str, archive_content: Dict[str, Any]) -> 
 — Числа, артикулы, аббревиатуры без расшифровки, транслит неизвестного происхождения — \
 это НЕ название книги.
 — Имя файла внутри архива типа «076510.pdf» — НЕ является названием книги.
-— При малейших сомнениях — запрашивай текст.
+— Содержимое FILE_ID.DIZ, NFO или README — ИНФОРМАТИВНО, используй его напрямую.
+— При малейших сомнениях (и только если нет метафайлов) — запрашивай текст.
 
 Верни JSON — один из двух вариантов:
 
-Если название книги однозначно известно:
+Если название книги однозначно известно (в т.ч. из метафайла):
 {{"decision": "rename", "new_name": "Автор - Название{archive_ext}"}}
 
-Во всех остальных случаях:
+Если информации недостаточно (и метафайлов нет или они пусты):
 {{"decision": "need_more_data", "action": "extract_text", "target": "{main_doc}", \
 "parameters": {{"type": "first_chars", "amount": 2000}}}}
 
@@ -142,6 +179,7 @@ def build_initial_prompt(archive_name: str, archive_content: Dict[str, Any]) -> 
 — Формат: «Автор - Название{archive_ext}» или «Название{archive_ext}».
 — Расширение строго {archive_ext} — не .pdf, не .djvu, не расширение файла внутри архива.
 — В поле «target» — точное имя файла из списка выше."""
+
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +241,15 @@ def build_text_analysis_prompt(archive_path: str, archive_content: Dict[str, Any
   ]
 }}
 
-Требования:
+Критически важно:
+— ЗАПРЕЩЕНО возвращать need_more_data — у тебя уже есть текст документа, достаточно для решения.
+— Если текст начинается с явного заголовка (первая строка) — это название документа.
+— Для технических справочников, шпаргалок, cheat sheet: «Тема Cheat Sheet{archive_ext}» — корректное имя.
+— Автор необязателен для справочников и шпаргалок без явного указания автора.
+— НИКОГДА не транслитерируй английские слова кириллицей. «Вхй Ёур Некст» — это ОШИБКА.
+— Если текст на английском → имя файла на английском: «Author - Title{archive_ext}»
+— Если текст на русском → имя файла на кириллице: «Автор - Название{archive_ext}»
 — Один вариант если уверенность выше 85%, иначе 2–3.
-— Кириллица для русских книг, латиница для английских. Транслит недопустим.
 — Расширение строго {archive_ext} — не .pdf, не .djvu.
 — Формат имени: «Автор - Название{archive_ext}» или «Название{archive_ext}»."""
 
@@ -262,6 +306,7 @@ def build_retry_prompt(archive_path: str, archive_content: Dict[str, Any],
 }}
 
 Требования:
+— ЗАПРЕЩЕНО возвращать need_more_data — это финальный запрос с максимумом доступных данных.
 — Кириллица для русских книг, латиница для английских. Без транслита.
 — Расширение строго {archive_ext}.
 — Формат: «Автор - Название{archive_ext}» или «Название{archive_ext}»."""

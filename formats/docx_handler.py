@@ -11,7 +11,7 @@ class DOCXHandler(BaseFormatHandler):
     @staticmethod
     def can_handle(file_path: str) -> bool:
         ext = BaseFormatHandler.get_file_extension(file_path)
-        return ext in ['.docx', '.doc']
+        return ext == '.docx'  # .doc обрабатывает DOCHandler через OLE
     
     @staticmethod
     def extract_text(file_path: str, parameters: Dict[str, Any]) -> str:

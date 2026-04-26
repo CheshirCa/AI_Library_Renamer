@@ -5,7 +5,7 @@ from .base_handler import BaseFormatHandler
 
 logger = logging.getLogger(__name__)
 
-_VERSION = "3.2.0"  # качество текста по первой странице + OCR fallback
+_VERSION = "3.3.0"  # удалён дубль extract_text; OCR через pymupdf рендеринг (JPXDecode fix)
 
 
 class PDFHandler(BaseFormatHandler):
@@ -132,23 +132,28 @@ class PDFHandler(BaseFormatHandler):
 
             logger.debug(f"pdftotext returncode={result.returncode}")
 
-            if result.returncode not in (0, 1):  # 1 = предупреждение
+            # Читаем результат из файла независимо от returncode:
+            # JPXDecode/JBIG2 ошибки (картинки) дают код 2+, но текстовый слой записан нормально.
+            try:
+                file_size = os.path.getsize(tmp_path)
+            except OSError:
+                file_size = 0
+
+            text = ""
+            if file_size > 0:
+                try:
+                    with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
+                        text = f.read().strip()
+                except Exception as e:
+                    logger.debug(f"pdftotext: не удалось прочитать temp-файл: {e}")
+            elif result.returncode not in (0, 1):
                 err = result.stderr.decode("utf-8", errors="replace")[:200]
                 logger.debug(f"pdftotext stderr: {err}")
-                return ""
 
-            # Читаем результат
             try:
-                with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
-                    text = f.read().strip()
-            except Exception as e:
-                logger.debug(f"pdftotext: не удалось прочитать temp-файл: {e}")
-                return ""
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
             if not text:
                 logger.debug("pdftotext: пустой результат")
@@ -164,97 +169,6 @@ class PDFHandler(BaseFormatHandler):
             logger.debug(f"pdftotext ошибка: {e}")
             return ""
 
-
-        """
-        Оценивает качество извлечённого текста.
-        Возвращает значение 0..1, где < MIN_READABLE_RATIO = мусор.
-
-        Проблема: PDF с кастомными шрифтами без ToUnicode маппинга даёт
-        читаемые ASCII-символы, но неполные: 'tnd ‐exploitation t t'
-        вместо 'Practical Firmware Reversing and Exploit Development'.
-
-        Признаки мусорного текста:
-        - Высокая доля одиночных символов среди слов (>30%)
-        - Очень маленькая средняя длина слова (<2.5)
-        - Мало слов длиннее 4 символов (<20% при наличии текста)
-        """
-        if not text or len(text.strip()) < 10:
-            return 0.0
-
-        import re
-        # Разбиваем на слова (только буквенные токены)
-        words = re.findall(r'[a-zA-Zа-яёА-ЯЁ]+', text)
-
-        if not words:
-            return 0.0
-
-        if len(words) < 3:
-            # Слишком мало слов для оценки — принимаем
-            return 0.8
-
-        single_char   = sum(1 for w in words if len(w) == 1)
-        long_words    = sum(1 for w in words if len(w) >= 4)
-        avg_len       = sum(len(w) for w in words) / len(words)
-        single_ratio  = single_char / len(words)
-        long_ratio    = long_words / len(words)
-
-        # Мусор: много одиночных букв + мало длинных слов + короткие слова в среднем
-        if single_ratio > 0.35 and avg_len < 3.0:
-            return 0.2
-        if single_ratio >= 0.45:  # >= вместо > — ловим ровно 50%
-            return 0.2
-        # Мало слов + много одиночных — тоже мусор (4 слова, 2 одиночки)
-        if len(words) <= 6 and single_ratio >= 0.35:
-            return 0.2
-        if avg_len < 2.0:
-            return 0.1
-        if long_ratio < 0.15 and len(words) > 10:
-            return 0.3
-
-        return 0.9  # хороший текст
-
-    @staticmethod
-    def extract_text(file_path: str, parameters: Dict[str, Any]) -> str:
-        action_type = parameters.get("type", "first_chars")
-        amount      = parameters.get("amount", 500)
-
-        # --- Попытка 1: pymupdf ---
-        try:
-            import fitz
-            text = PDFHandler._extract_with_fitz(fitz, file_path, action_type, amount)
-            if text:
-                quality = PDFHandler._text_quality(text)
-                if quality >= PDFHandler._MIN_READABLE_RATIO:
-                    return text
-                logger.info(
-                    f"pymupdf: качество текста низкое ({quality:.0%}) — "
-                    f"вероятно кастомный шрифт без ToUnicode. Пробуем OCR."
-                )
-            else:
-                logger.info(f"pymupdf: текстового слоя нет в {os.path.basename(file_path)}, пробуем OCR")
-        except ImportError:
-            logger.warning("pymupdf не установлен, пробуем PyPDF2...")
-        except Exception as e:
-            logger.warning(f"pymupdf ошибка: {e}, пробуем PyPDF2...")
-
-        # --- Попытка 2: PyPDF2 ---
-        try:
-            import PyPDF2
-            text = PDFHandler._extract_with_pypdf2(PyPDF2, file_path, action_type, amount)
-            if text:
-                quality = PDFHandler._text_quality(text)
-                if quality >= PDFHandler._MIN_READABLE_RATIO:
-                    return text
-                logger.info(f"PyPDF2: качество текста низкое ({quality:.0%}), пробуем OCR")
-            else:
-                logger.info(f"PyPDF2: текстового слоя нет, пробуем OCR")
-        except ImportError:
-            logger.warning("PyPDF2 не установлен")
-        except Exception as e:
-            logger.warning(f"PyPDF2 ошибка: {e}")
-
-        # --- Попытка 3: OCR через pdf2image + tesseract ---
-        return PDFHandler._ocr_pdf(file_path, amount, action_type)
 
     @staticmethod
     def _extract_with_fitz(fitz, file_path: str, action_type: str, amount: int) -> str:
@@ -321,50 +235,89 @@ class PDFHandler(BaseFormatHandler):
         return text[:amount] if (result and action_type == "first_chars") else (text if result else "")
 
     @staticmethod
-    def _ocr_first_page(file_path: str) -> str:
-        """OCR только первой страницы — для извлечения заголовка из презентаций
-        где титульный слайд нарисован как графика."""
+    def _render_pages_fitz(file_path: str, first_page: int, last_page: int,
+                           dpi: int = 150) -> list:
+        """
+        Рендерит страницы PDF через pymupdf → список PIL.Image.
+        Работает с JPXDecode и JBIG2 — MuPDF поддерживает эти фильтры нативно,
+        в отличие от старых сборок poppler/pdftoppm.
+        """
         try:
-            from pdf2image import convert_from_path
-            from .ocr_utils import perform_ocr_images
-            poppler_path = PDFHandler._find_poppler()
-            kwargs = {"first_page": 1, "last_page": 1, "dpi": 200}
-            if poppler_path:
-                kwargs["poppler_path"] = poppler_path
-            images = convert_from_path(file_path, **kwargs)
-            if not images:
-                return ""
-            text = perform_ocr_images(images, lang="rus+eng", max_chars=1000)
-            if text:
-                logger.info(f"OCR стр.1: извлечено {len(text)} символов")
-            return text
+            import fitz
+            from PIL import Image
+            doc = fitz.open(file_path)
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            images = []
+            for page_num in range(first_page - 1, min(last_page, len(doc))):
+                pix = doc[page_num].get_pixmap(matrix=mat)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                images.append(img)
+            doc.close()
+            return images
         except Exception as e:
-            logger.debug(f"OCR первой страницы не удался: {e}")
+            logger.debug(f"fitz rendering: {e}")
+            return []
+
+    @staticmethod
+    def _ocr_first_page(file_path: str) -> str:
+        """OCR первой страницы — для заголовков нарисованных как графика."""
+        try:
+            from .ocr_utils import perform_ocr_images
+        except ImportError as e:
             return ""
+
+        # Попытка 1: pymupdf (поддерживает JPXDecode/JBIG2)
+        images = PDFHandler._render_pages_fitz(file_path, 1, 1, dpi=200)
+
+        if not images:
+            # Попытка 2: pdftoppm через pdf2image
+            try:
+                from pdf2image import convert_from_path
+                poppler_path = PDFHandler._find_poppler()
+                kwargs = {"first_page": 1, "last_page": 1, "dpi": 200}
+                if poppler_path:
+                    kwargs["poppler_path"] = poppler_path
+                images = convert_from_path(file_path, **kwargs)
+            except Exception as e:
+                logger.debug(f"OCR первой страницы не удался: {e}")
+                return ""
+
+        if not images:
+            return ""
+        text = perform_ocr_images(images, lang="rus+eng", max_chars=1000)
+        if text:
+            logger.info(f"OCR стр.1: извлечено {len(text)} символов")
+        return text
 
     @staticmethod
     def _ocr_pdf(file_path: str, amount: int, action_type: str) -> str:
-        """OCR через pdf2image (требует poppler) + pytesseract."""
+        """OCR через pymupdf-рендеринг (основной) или pdf2image (fallback)."""
         try:
-            from pdf2image import convert_from_path
             from .ocr_utils import perform_ocr_images
         except ImportError as e:
-            return f"OCR недоступен: {e}. Установите pytesseract и poppler."
+            return f"OCR недоступен: {e}. Установите pytesseract и pillow."
 
-        try:
-            # На Windows pdf2image ищет pdftoppm в PATH или poppler_path
-            poppler_path = PDFHandler._find_poppler()
-            kwargs = {"first_page": 1, "last_page": 3, "dpi": 150}
-            if poppler_path:
-                kwargs["poppler_path"] = poppler_path
+        # Попытка 1: pymupdf рендеринг (поддерживает JPXDecode/JBIG2)
+        images = PDFHandler._render_pages_fitz(file_path, 1, 3, dpi=150)
 
-            images = convert_from_path(file_path, **kwargs)
-            max_chars = amount if action_type == "first_chars" else None
-            return perform_ocr_images(images, lang="rus+eng", max_chars=max_chars)
+        if not images:
+            # Попытка 2: pdftoppm через pdf2image (может не поддерживать JPX)
+            try:
+                from pdf2image import convert_from_path
+                poppler_path = PDFHandler._find_poppler()
+                kwargs = {"first_page": 1, "last_page": 3, "dpi": 150}
+                if poppler_path:
+                    kwargs["poppler_path"] = poppler_path
+                images = convert_from_path(file_path, **kwargs)
+            except Exception as e:
+                logger.error(f"OCR PDF не удался: {e}")
+                return ""
 
-        except Exception as e:
-            logger.error(f"OCR PDF не удался: {e}")
-            return ""   # возвращаем пустую строку, а не текст ошибки
+        if not images:
+            return ""
+
+        max_chars = amount if action_type == "first_chars" else None
+        return perform_ocr_images(images, lang="rus+eng", max_chars=max_chars)
 
     @staticmethod
     def _find_poppler() -> str:

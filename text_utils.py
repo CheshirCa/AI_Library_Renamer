@@ -177,7 +177,41 @@ def _phrase_is_translit(phrase: str) -> bool:
         r'book|look|cook|took|hook|shook)\b',
         phrase, re.IGNORECASE
     ))
-    if weak_ru and not english_common:
+    # Технические и документальные термины — маркеры английского языка.
+    # Без них "Clean Code Checklist", "Design Patterns" и т.п. ошибочно
+    # транслитерируются в "Слеан Соде Чеклист", "Десигн Паттернс".
+    english_tech = bool(re.search(
+        r'\b(?:'
+        # Ключевые слова программирования и разработки
+        r'code|coding|coder|clean|check(?:list)?|debug|debugger|test(?:ing)?|'
+        r'learn(?:ing)?|design|pattern(?:s)?|practice(?:s)?|principle(?:s)?|'
+        r'class(?:es)?|object|method|function|variable|type|interface|'
+        r'data|base|database|'
+        # Бизнес и CRM/ERP
+        r'dashboard(?:s)?|ebook|e-book|crm|erp|'
+        r'microsoft|dynamics|sharepoint|azure|office|'
+        r'cloud|online|analytics|reporting|'
+        r'business|process(?:es)?|management|performance|'
+        r'sales|marketing|service(?:s)?|workflow|'
+        # Документальные термины
+        r'cheat|sheet|syntax|'
+        r'guide|reference|tutorial|workshop|handbook|cookbook|primer|'
+        r'quick|start|overview|summary|intro(?:duction)?|'
+        r'version|edition|release|'
+        # Веб и инфраструктура
+        r'html|css|sql|php|json|xml|yaml|api|'
+        r'web|app|service|server|client|system|'
+        # Общие английские слова
+        r'how|what|when|where|why|'
+        r'my|your|our|its|'
+        r'not|but|for|from|into|with|'
+        r'use|using|get|set|run|build|make|'
+        r'step|example|examples|install|setup|'
+        r'simple|easy|fast|smart|modern|practical|complete|essential'
+        r')\b',
+        phrase, re.IGNORECASE
+    ))
+    if weak_ru and not english_common and not english_tech:
         return True
 
     return False

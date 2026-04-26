@@ -4,8 +4,10 @@ from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
+_VERSION = "2.0.0"  # без _fallback_extract_text, с форматными приоритетами
+
 # Расширения, которые считаются основным документом книги
-DOCUMENT_EXTENSIONS = {'.pdf', '.docx', '.doc', '.rtf', '.txt', '.fb2', '.djvu', '.epub', '.mobi', '.azw', '.azw3'}
+DOCUMENT_EXTENSIONS = {'.pdf', '.docx', '.doc', '.rtf', '.chm', '.txt', '.fb2', '.djvu', '.epub', '.mobi', '.azw', '.azw3'}
 # .zip убран намеренно: вложенный архив не может быть основным документом
 
 # Приоритет форматов: чем ниже индекс — тем предпочтительнее

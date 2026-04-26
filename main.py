@@ -8,6 +8,8 @@ import shutil
 import argparse
 import fnmatch
 
+_VERSION = "1.0.0"  # интерактивный цикл, bad-translit детектор, --dir/--debug
+
 # Позволяет запускать скрипт из любой директории
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -76,6 +78,30 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
     name = name.strip('. ')
     return name or "renamed_archive"
+
+
+def _looks_like_bad_translit(name: str) -> bool:
+    """
+    Проверяет не является ли имя транслитерацией английского текста на кириллицу.
+    Примеры: "Вхй Ёур Некст Радио" (Why Your Next Radio)
+             "Фар 3 Кейбоард Шортсуц" (FAR 3 Keyboard Shortcuts)
+    """
+    stem = os.path.splitext(name)[0]
+    if not re.search(r'[а-яёА-ЯЁ]', stem):
+        return False
+
+    bad_words = [
+        'Вхй', 'Ёур', 'Некст', 'Вилл', 'Хау', 'Уитх', 'Фром', 'Тхат', 'Тхис',
+        'Кейбоард', 'Шортсуц', 'Шорткутс', 'Воркфлоу', 'Фреймворк',
+        'Ундерстандинг', 'Интродуктион', 'Хандбоок', 'Гуиде', 'Туториал',
+        'Леарнинг', 'Программинг', 'Девелопмент', 'Манагемент', 'Бусинесс',
+    ]
+    pattern = re.compile(
+        r'\b(?:' + '|'.join(re.escape(w) for w in bad_words) + r')\b',
+        re.IGNORECASE
+    )
+    return bool(pattern.search(stem))
+
 
 
 # Расширения файлов-содержимого, которые LLM может ошибочно добавить в имя архива
@@ -155,11 +181,215 @@ def _is_extraction_error(text: str) -> bool:
     return any(text.strip().startswith(p) for p in ERROR_PREFIXES)
 
 
+def _pdftotext_find_tool() -> str:
+    """
+    Ищет pdftotext, предпочитая Poppler (поддерживает PDF 1.7+) над xpdf
+    (поддерживает только до PDF 1.4).
+    Известные пути Poppler проверяются ДО shutil.which, чтобы xpdf в PATH
+    не перехватил вызов раньше Poppler.
+    """
+    # Известные пути Poppler — проверяем первыми
+    for d in [r"C:\gnuwin32\poppler\bin",
+              r"C:\poppler\Library\bin",
+              r"C:\poppler\bin",
+              r"C:\Program Files\poppler\bin",
+              r"C:\Program Files\poppler\Library\bin",
+              r"C:\tools\poppler\Library\bin"]:
+        for name in ("pdftotext.exe", "pdftotext"):
+            cand = os.path.join(d, name)
+            if os.path.isfile(cand):
+                logger.debug(f"pdftotext (poppler): {cand}")
+                return cand
+    # Fallback: что есть в PATH (может быть xpdf или другое)
+    tool = shutil.which("pdftotext") or shutil.which("pdftotext.exe")
+    if tool:
+        logger.debug(f"pdftotext (PATH): {tool}")
+    return tool or ""
+
+
+def _pdftotext_run(tool: str, file_path: str, extra_args: list) -> str:
+    """Запускает pdftotext с заданными флагами, возвращает текст или "".
+    Результат читается из временного файла независимо от returncode:
+    JPXDecode/JBIG2 ошибки (только картинки) дают код 2+, но текстовый
+    слой при этом записывается нормально."""
+    import subprocess, tempfile
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
+            tmp_path = tmp.name
+        result = subprocess.run(
+            [tool, "-enc", "UTF-8"] + extra_args + [file_path, tmp_path],
+            capture_output=True, timeout=30
+        )
+        # Читаем файл если он непустой — даже при returncode > 1.
+        # JPXDecode/JBIG2 — ошибки декодирования картинок, текстовый слой не затрагивают.
+        try:
+            file_size = os.path.getsize(tmp_path)
+        except OSError:
+            file_size = 0
+        if file_size > 0:
+            with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read().strip()
+        else:
+            text = ""
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        stderr_snippet = result.stderr.decode("utf-8", errors="replace")[:120].strip()
+        logger.debug(
+            f"pdftotext {extra_args}: returncode={result.returncode}, "
+            f"file_size={file_size}, text_len={len(text)}"
+            + (f", stderr: {stderr_snippet}" if stderr_snippet else "")
+        )
+        # xpdf (не poppler) не поддерживает PDF 1.5+ — файл остаётся пустым
+        if file_size == 0 and "xpdf supports version" in stderr_snippet:
+            logger.warning(
+                "pdftotext: обнаружен xpdf, который не поддерживает PDF 1.5+. "
+                "Установите Poppler в C:\\gnuwin32\\poppler\\bin или C:\\poppler\\bin"
+            )
+            return ""
+        if not text and result.returncode not in (0, 1):
+            return ""
+        return text
+    except Exception as e:
+        logger.debug(f"pdftotext ошибка ({extra_args}): {e}")
+        return ""
+
+
+def _text_is_rtl_reversed(text: str) -> bool:
+    """
+    Определяет что текст перевёрнут посимвольно (RTL-баг encoding в PDF).
+    Признак: слова написаны задом наперёд ('ялд'='для', 'агинк'='книга').
+
+    ВАЖНО: предлоги/союзы ('в', 'на', 'с', 'к', 'и') НЕ используются —
+    они одинаковы в нормальном и RTL тексте (однобуквенные симметричны,
+    двубуквенные — обычные слова), что вызывает ложные срабатывания.
+    Используем только длинные (4+ букв) слова, не существующие в русском.
+    """
+    reversed_words = {
+        'ялд',            # для
+        'агинк',          # книга
+        'аглав',          # глава
+        'яинедевс',       # сведения
+        'яицатнемукод',   # документация
+        'иинавичакс',     # скачивания
+        'иицакифитнеди',  # идентификации
+        'яинешер',        # решения
+        'яинежолопсар',   # расположения
+        'тфосоркйам',     # майкрософт
+        'иицазиротва',    # авторизации
+        'иицакифинтелуа', # аутентификации
+    }
+    # Только слова 4+ букв — предлоги и союзы не участвуют
+    sample = re.findall(r'[а-яёА-ЯЁ]{4,}', text[:600])
+    hits = sum(1 for w in sample if w.lower() in reversed_words)
+    return hits >= 2
+
+
+def _fix_rtl_text(text: str) -> str:
+    """Исправляет посимвольно перевёрнутый текст."""
+    import re
+    lines = text.split('\n')
+    fixed = []
+    for line in lines:
+        # Разбиваем на слова и пробелы, переворачиваем только слова
+        tokens = re.split(r'(\s+)', line)
+        fixed.append(''.join(t[::-1] if t.strip() else t for t in tokens))
+    return '\n'.join(fixed)
+
+
+def _try_pdftotext(file_path: str, amount: int) -> str:
+    """
+    Вызывает pdftotext с несколькими стратегиями флагов.
+    Автоматически исправляет RTL-перевёрнутый текст.
+    Если путь содержит не-ASCII символы (кириллица в имени папки) —
+    копирует файл во временный ASCII-путь перед вызовом: gnuwin32-сборки
+    poppler компилированы как ANSI-приложения и тихо падают на Unicode-путях.
+    """
+    tool = _pdftotext_find_tool()
+    if not tool:
+        return ""
+
+    # Копируем в ASCII-путь если нужно
+    safe_path = file_path
+    tmp_copy  = None
+    if not file_path.isascii():
+        try:
+            import tempfile as _tf
+            fd, tmp_copy = _tf.mkstemp(suffix=".pdf")
+            os.close(fd)
+            shutil.copy2(file_path, tmp_copy)
+            safe_path = tmp_copy
+            logger.debug(f"pdftotext: путь содержит не-ASCII, копируем в {tmp_copy}")
+        except Exception as e:
+            logger.debug(f"pdftotext: не удалось создать ASCII-копию: {e}")
+            tmp_copy = None
+
+    # Стратегии: стандартный → без layout → raw
+    strategies = [["-layout"], [], ["-raw"]]
+
+    best_text = ""
+    try:
+        for flags in strategies:
+            text = _pdftotext_run(tool, safe_path, flags)
+            if not text:
+                continue
+            if _text_is_rtl_reversed(text):
+                logger.info(f"pdftotext {flags}: RTL-перевёрнутый текст, исправляем")
+                text = _fix_rtl_text(text)
+            if len(text) > len(best_text):
+                best_text = text
+            if len(best_text) > 500:
+                break
+    finally:
+        if tmp_copy:
+            try:
+                os.unlink(tmp_copy)
+            except Exception:
+                pass
+
+    if best_text:
+        logger.info(f"pdftotext: извлечено {len(best_text)} символов из {os.path.basename(file_path)}")
+    return best_text[:amount] if best_text else ""
+
+
 def _extract_text_for_file(archive_content: dict, target: str, parameters: dict):
     file_obj = _resolve_file(archive_content, target)
     if not file_obj:
         logger.error("В архиве не найдено подходящих файлов")
         return None, None
+
+    amount = parameters.get('amount', 2000)
+
+    # EPUB / MOBI / AZW / FB2: сначала пробуем метаданные (title/author из OPF/EXTH/XML).
+    # Это мгновенно и даёт точный ответ без извлечения и парсинга текста.
+    ext = os.path.splitext(file_obj['name'])[1].lower()
+    if ext in ('.epub', '.mobi', '.azw', '.azw3', '.fb2'):
+        try:
+            from formats import get_file_metadata
+            meta = get_file_metadata(file_obj['path'])
+            parts = []
+            if meta.get('author'):
+                parts.append(f"Автор: {meta['author']}")
+            if meta.get('title'):
+                parts.append(f"Название: {meta['title']}")
+            if meta.get('publisher'):
+                parts.append(f"Издательство: {meta['publisher']}")
+            if parts:
+                meta_text = '\n'.join(parts)
+                logger.info(f"Метаданные {ext}: {meta_text[:120]}")
+                return file_obj, meta_text
+        except Exception as e:
+            logger.debug(f"Метаданные {ext} недоступны: {e}")
+
+    # Специальный путь для PDF: pdftotext даёт лучший результат чем pymupdf
+    # для файлов с нестандартным ToUnicode маппингом шрифтов
+    if file_obj['name'].lower().endswith('.pdf'):
+        pdf_text = _try_pdftotext(file_obj['path'], amount)
+        if pdf_text and len(pdf_text.strip()) > 50:
+            logger.debug(f"pdftotext успешно: {len(pdf_text)} символов из '{file_obj['name']}'")
+            return file_obj, pdf_text
+
     text = extract_text_data(file_obj["path"], parameters)
     if _is_extraction_error(text):
         fname = file_obj['name']
@@ -167,6 +397,17 @@ def _extract_text_for_file(archive_content: dict, target: str, parameters: dict)
         return file_obj, None   # None = ошибка извлечения
     logger.debug(f"Извлечено {len(text)} символов из '{file_obj['name']}'")
     return file_obj, text
+
+
+def _confirm_custom_name(name: str, archive_ext: str) -> str:
+    """Просит подтвердить введённое пользователем имя."""
+    if not name.endswith(archive_ext):
+        name = name + archive_ext
+    clean = sanitize_filename(name)
+    confirm = input(f"  Принять «{clean}»? [y/Enter — да, n — ввести заново]: ").strip().lower()
+    if confirm in ('n', 'н', 'no', 'нет'):
+        return ''
+    return name
 
 
 def _ask_user_about_variants(names: list, variants: list) -> tuple:
@@ -179,7 +420,9 @@ def _ask_user_about_variants(names: list, variants: list) -> tuple:
         clean = sanitize_filename(name)
         confidence = ""
         reason = ""
-        if i - 1 < len(variants):
+        if _looks_like_bad_translit(name):
+            confidence = " [⚠ возможно ошибочный транслит английского]"
+        elif i - 1 < len(variants):
             v = variants[i - 1]
             confidence = f" [{v.get('confidence', '?')}%]"
             reason = f" — {v.get('reason', '')}" if v.get('reason') else ""
@@ -188,7 +431,6 @@ def _ask_user_about_variants(names: list, variants: list) -> tuple:
     print("  Введи номер варианта, [n] искать дальше, [s] пропустить, или своё имя:")
     answer = input("  > ").strip()
 
-    # Цифровой выбор
     if answer.isdigit():
         idx = int(answer) - 1
         if 0 <= idx < len(names):
@@ -200,8 +442,13 @@ def _ask_user_about_variants(names: list, variants: list) -> tuple:
         return 'retry', names[0]
     if answer.lower() in ('s', 'п', 'skip', 'пропустить', ''):
         return 'skip', names[0]
-    # Своё имя
-    return answer, answer
+
+    # Своё имя — подтверждаем
+    archive_ext = os.path.splitext(names[0])[1] if names else '.rar'
+    confirmed = _confirm_custom_name(answer, archive_ext)
+    if not confirmed:
+        return _ask_user_about_variants(names, variants)  # повторяем
+    return confirmed, confirmed
 
 
 def _ask_user_about_name(proposed_name: str) -> str:
@@ -213,7 +460,14 @@ def _ask_user_about_name(proposed_name: str) -> str:
       <строка>  - своё имя, введённое пользователем
     """
     clean = sanitize_filename(proposed_name)
-    print(f"\n  Предлагаемое имя: {clean}")
+
+    if _looks_like_bad_translit(proposed_name):
+        print(f"\n  ⚠  Предлагаемое имя похоже на ошибочный транслит английского:")
+        print(f"  {clean}")
+        print("  Рекомендуется нажать [n] для поиска дополнительной информации.")
+    else:
+        print(f"\n  Предлагаемое имя: {clean}")
+
     print("  [y] Принять   [n] Не то, искать дальше   [s] Пропустить   [имя] Ввести своё")
     answer = input("  > ").strip()
 
@@ -223,7 +477,13 @@ def _ask_user_about_name(proposed_name: str) -> str:
         return 'skip'
     if answer.lower() in ('n', 'н', 'no', 'нет'):
         return 'retry'
-    return answer  # пользователь ввёл своё имя
+
+    # Своё имя — подтверждаем
+    archive_ext = os.path.splitext(proposed_name)[1]
+    confirmed = _confirm_custom_name(answer, archive_ext)
+    if not confirmed:
+        return _ask_user_about_name(proposed_name)  # повторяем
+    return confirmed
 
 
 def _ask_manual_name(archive_path: str, extracted_texts: list = None) -> None:
@@ -232,7 +492,6 @@ def _ask_manual_name(archive_path: str, extracted_texts: list = None) -> None:
     """
     print(f"\n  Не удалось автоматически определить название: {os.path.basename(archive_path)}")
 
-    # Показываем фрагмент текста чтобы пользователь мог ориентироваться
     if extracted_texts:
         last = extracted_texts[-1]
         preview = (last.get('text') or '').strip()[:400].replace('\n', ' ')
@@ -241,14 +500,16 @@ def _ask_manual_name(archive_path: str, extracted_texts: list = None) -> None:
             print(f"  {preview}")
             print()
 
-    answer = input("  Введите имя вручную (Enter — пропустить): ").strip()
-    if answer:
-        archive_ext = os.path.splitext(archive_path)[1]
-        if not answer.endswith(archive_ext):
-            answer += archive_ext
-        rename_file(archive_path, answer)
-    else:
-        print("  Пропускаем.")
+    archive_ext = os.path.splitext(archive_path)[1]
+    while True:
+        answer = input("  Введите имя вручную (Enter — пропустить): ").strip()
+        if not answer:
+            print("  Пропускаем.")
+            return
+        confirmed = _confirm_custom_name(answer, archive_ext)
+        if confirmed:
+            rename_file(archive_path, confirmed)
+            return
 
 
 def handle_llm_decision(archive_path: str, archive_content: dict,
@@ -344,6 +605,19 @@ def handle_llm_decision(archive_path: str, archive_content: dict,
         target = llm_response.get('target', '')
         params = llm_response.get('parameters', {'type': 'first_chars', 'amount': 2000})
 
+        # Если мы уже отправляли LLM текст из архива, а она снова просит need_more_data —
+        # это признак что 2000 символов недостаточно (TOC, пустая первая страница и т.п.).
+        # Удваиваем amount автоматически, не доверяя параметрам от LLM.
+        if _extracted_texts:
+            prev_amount = max(e.get('amount', 2000) for e in _extracted_texts)
+            auto_amount = min(prev_amount * 2, 8000)
+            if auto_amount > params.get('amount', 2000):
+                logger.info(
+                    f"LLM повторно запрашивает текст (уже было {prev_amount} симв.), "
+                    f"расширяем до {auto_amount}"
+                )
+                params = {**params, 'amount': auto_amount}
+
         file_obj, text = _extract_text_for_file(archive_content, target, params)
         if not file_obj:
             _ask_manual_name(archive_path, _extracted_texts)
@@ -407,8 +681,10 @@ def _retry_with_more_data(archive_path: str, archive_content: dict,
         params      = {'type': 'first_chars', 'amount': new_amount}
         logger.info(f"Расширяем выборку из '{file_obj['name']}' до {new_amount} символов")
 
-    text = extract_text_data(file_obj['path'], params)
-    if _is_extraction_error(text):
+    # Используем _extract_text_for_file — он содержит pdftotext-путь для PDF
+    # и metadata-путь для EPUB/MOBI/FB2, что надёжнее прямого extract_text_data
+    _, text = _extract_text_for_file(archive_content, file_obj['name'], params)
+    if text is None or _is_extraction_error(text):
         logger.warning(f"Не удалось извлечь текст из '{file_obj['name']}'")
         _ask_manual_name(archive_path, _extracted_texts)
         return
@@ -525,7 +801,7 @@ def analyze_archive(archive_path: str, auto_rename: bool = False) -> None:
 
 
 def process_directory(dir_path: str, auto_rename: bool = False,
-                      extensions: tuple = ('.zip', '.rar')) -> None:
+                      extensions: tuple = ('.zip', '.rar', '.7z')) -> None:
     archives = [
         os.path.join(dir_path, f)
         for f in os.listdir(dir_path)
@@ -544,6 +820,7 @@ def process_directory(dir_path: str, auto_rename: bool = False,
 
 
 def main():
+    # Версии выводятся при --debug
     parser = argparse.ArgumentParser(description="Авто-переименование архивов с книгами")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--file", help="Путь к одному архиву")
@@ -560,6 +837,32 @@ def main():
         level=logging.DEBUG if args.debug else logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
+
+    # Версии компонентов — всегда видны в логе
+    _components = [f"main v{_VERSION}"]
+    try:
+        from formats.pdf_handler import _VERSION as _pdf_v
+        _components.append(f"pdf_handler v{_pdf_v}")
+    except ImportError:
+        _components.append("pdf_handler СТАРАЯ ВЕРСИЯ")
+        logger.warning("pdf_handler.py устарел — скопируйте новую версию!")
+    try:
+        from formats.txt_handler import _VERSION as _txt_v
+        _components.append(f"txt_handler v{_txt_v}")
+    except ImportError:
+        _components.append("txt_handler СТАРАЯ ВЕРСИЯ")
+    try:
+        from file_tools import _VERSION as _ft_v
+        _components.append(f"file_tools v{_ft_v}")
+    except ImportError:
+        _components.append("file_tools СТАРАЯ ВЕРСИЯ (использует PyPDF2 напрямую!)")
+        logger.warning("file_tools.py устарел — PDF будет читаться через PyPDF2, минуя хэндлеры!")
+    try:
+        from formats import _VERSION as _fmt_v
+        _components.append(f"formats v{_fmt_v}")
+    except ImportError:
+        _components.append("formats/__init__ без версии")
+    logger.info("AI Library Renamer | " + " | ".join(_components))
 
     # Переопределяем OUTPUT_BASE_DIR если передан --output-dir
     if args.output_dir:
